@@ -22,6 +22,7 @@ import streamlit as st
 from bs4 import BeautifulSoup
 from lxml import etree
 from more_itertools import chunked
+import altair as alt
 
 # ─────────── Config ───────────
 DEFAULT_TIMEOUT = 20
@@ -57,16 +58,18 @@ def compile_patterns(tokens: Sequence[str]) -> List[re.Pattern]:
     return [re.compile("|".join(tokens[i:i + REGEX_CHUNK_SIZE]), re.IGNORECASE)
             for i in range(0, len(tokens), REGEX_CHUNK_SIZE)]
 
-# ─────────── HTTP fetch ───────────
-async def fetch(session: aiohttp.ClientSession, url: str) -> bytes:
-    try:
-        async with async_timeout.timeout(DEFAULT_TIMEOUT):
-            async with session.get(url, ssl=False) as resp:
-                resp.raise_for_status()
-                return await resp.read()
-    except Exception as exc:
-        LOGGER.warning("Fetch failed %s → %s", url, exc)
-        raise
+# ─────────── HTTP fetch with retries ───────────
+async def fetch(session: aiohttp.ClientSession, url: str, retries=3, backoff=1.5) -> bytes:
+    for i in range(retries):
+        try:
+            async with async_timeout.timeout(DEFAULT_TIMEOUT):
+                async with session.get(url, ssl=False) as resp:
+                    resp.raise_for_status()
+                    return await resp.read()
+        except Exception as exc:
+            LOGGER.warning(f"[Retry {i+1}] {url} failed → {exc}")
+            await asyncio.sleep(backoff * (2 ** i))
+    raise Exception(f"Failed after {retries} retries → {url}")
 
 # ─────────── Sitemap discovery ───────────
 async def _locs_from_sitemap(session: aiohttp.ClientSession, url: str) -> List[str]:
@@ -107,9 +110,11 @@ def to_jamku_urls(pice_urls: List[str]) -> List[str]:
 
 # ─────────── Scan page content ───────────
 def extract_slab_and_turnover(html: str) -> Tuple[str, str]:
-    slab_match = re.search(r"Slab: ([^<\n]*)", html, re.IGNORECASE)
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+    slab_match = re.search(r"slab[^:\n]*[:\-–]\s*([\w\₹ ,%]*)", text, re.IGNORECASE)
+    turnover_match = re.search(r"turnover[^:\n]*[:\-–]\s*([\w\₹ ,%]*)", text, re.IGNORECASE)
     slab = slab_match.group(1).strip() if slab_match else ""
-    turnover_match = re.search(r"Turnover[^:<\n]*[:\s]+([^<\n]*)", html, re.IGNORECASE)
     turnover = turnover_match.group(1).strip() if turnover_match else ""
     return slab, turnover
 
@@ -119,13 +124,12 @@ async def _page_scan(session: aiohttp.ClientSession, url: str, patterns: List[re
             html = (await fetch(session, url)).decode("utf-8", errors="ignore")
         except Exception:
             return None
-        for pat in patterns:
-            m = pat.search(html)
-            if m:
-                soup = BeautifulSoup(html, "html.parser")
-                title = (soup.title.string or "").strip() if soup.title else ""
-                slab, turnover = extract_slab_and_turnover(html)
-                return url, m.group(0), title, slab, turnover
+        m = next((pat.search(html) for pat in patterns if pat.search(html)), None)
+        if m:
+            soup = BeautifulSoup(html, "html.parser")
+            title = (soup.title.string or "").strip() if soup.title else ""
+            slab, turnover = extract_slab_and_turnover(html)
+            return url, m.group(0), title, slab, turnover
         return None
 
 # ─────────── Orchestrator ───────────
@@ -134,7 +138,7 @@ async def crawl(sitemaps: List[str], raw_keywords: List[str], mode: str, concurr
     patterns = compile_patterns(flat_keywords)
     sem = asyncio.Semaphore(concurrency)
     timeout = aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT)
-    connector = aiohttp.TCPConnector(limit=concurrency)
+    connector = aiohttp.TCPConnector(limit=concurrency, force_close=True)
     results = []
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
@@ -197,3 +201,11 @@ if submitted:
         st.warning("⚠️ No keyword matches found.")
     else:
         st.dataframe(df, use_container_width=True)
+        count_by_root = df["matched_root"].value_counts().reset_index()
+        count_by_root.columns = ["matched_root", "count"]
+        st.altair_chart(
+            alt.Chart(count_by_root).mark_bar().encode(
+                x="matched_root:N", y="count:Q", tooltip=["matched_root", "count"]
+            ).properties(height=400),
+            use_container_width=True
+        )
