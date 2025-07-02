@@ -10,3 +10,4 @@ pandas
 bs4
 lxml
 altair
+ujson
