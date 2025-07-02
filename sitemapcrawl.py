@@ -155,13 +155,25 @@ async def crawl(sitemaps: List[str], raw_kw: List[str], mode: str,
         start, scanned = time.perf_counter(), 0
         prog = st.progress(0.0, text="🔎 Scanning …")
 
-        for batch in chunked(pages, batch_size):
-            tasks = [_scan_page(session, u, patterns, sem) for u in batch]
-            for res in await asyncio.gather(*tasks, return_exceptions=True):
-                scanned += 1
-                if isinstance(res, tuple):
-                    results.append(res)
-            prog.progress(scanned / len(pages))
+        if mode == "Jamku":
+    sem = asyncio.Semaphore(5)  # max 5 concurrent requests
+    for i in range(0, len(pages), 5):
+        batch = pages[i:i+5]
+        tasks = [_scan_page(session, u, patterns, sem) for u in batch]
+        for res in await asyncio.gather(*tasks, return_exceptions=True):
+            scanned += 1
+            if isinstance(res, tuple):
+                results.append(res)
+        prog.progress(scanned / len(pages))
+        await asyncio.sleep(1)  # Enforce 5 requests per second
+else:
+    for batch in chunked(pages, batch_size):
+        tasks = [_scan_page(session, u, patterns, sem) for u in batch]
+        for res in await asyncio.gather(*tasks, return_exceptions=True):
+            scanned += 1
+            if isinstance(res, tuple):
+                results.append(res)
+        prog.progress(scanned / len(pages))
 
         prog.empty()
         st.success(f"✅ Completed in {time.perf_counter() - start:.1f}s — {len(results):,} matches")
