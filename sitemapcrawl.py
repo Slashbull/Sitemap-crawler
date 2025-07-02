@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Keyword Sitemap Crawler — Ultimate Turbo Edition 🚀
+Keyword Sitemap Crawler — Ultimate Turbo Edition 🚀
 =================================================
-* Two-phase scan – Piceapp first (massively async) → Jamku fallback (rate-limited but parallel).
-* Root-aware HS-code keyword matching with ultra-fast pre-check to skip regex on non-candidates.
-* Max-speed I/O: `aiohttp` w/ HTTP-2, keep-alive, gzip, DNS cache; configurable concurrency & rate.
-* Smart retries with exponential back-off and separate Jamku retry logic.
-* Streamlit UI: minimal redraws, auto-refresh to prevent idle timeout, live checkpoints, large-data safeguards.
-* Resumable – writes partial CSV every *n* batches so you never lose progress.
+* **Two‑phase scan** – Piceapp first (massively async) → Jamku fallback (rate‑limited, parallel).
+* **Root‑aware HS‑code keyword matching** with ultra‑fast *pre‑check* to skip regex on non‑candidates.
+* **Max‑speed I/O**: `aiohttp` keep‑alive, gzip, DNS cache; configurable concurrency & rate.
+* **Smart retries** with exponential back‑off + detailed logging; safe HTTP/2 attempt.
+* **Streamlit UI**: minimal redraws, optional auto‑refresh, live checkpoints, big‑data safeguards.
+* **Resumable** – writes partial CSV every *n* batches so you never lose progress.
 
-© 2025 — Designed for 1M+ pages. MIT License.
+© 2025 — Designed for 1 M+ pages. MIT License.
 """
 
 from __future__ import annotations
@@ -34,11 +34,11 @@ from more_itertools import chunked
 import altair as alt
 
 try:
-    import ujson as json  # ultra-fast JSON for checkpoints
-except ImportError:
-    import json
+    import ujson as json  # fast checkpoints
+except ImportError:  # fallback
+    import json  # type: ignore
 
-# ─── Config ───
+# ────────── Config ──────────
 DEFAULT_TIMEOUT = 20
 DEFAULT_CONCURRENCY = 100
 DEFAULT_BATCH_SIZE = 1_000
@@ -51,24 +51,27 @@ SAMPLE_PRECHECK = 20
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 LOG = logging.getLogger("kws-crawler")
 
+# ────────── Keyword helpers ──────────
+
+MAX_KEYWORD_LEN = 50
 
 def _validate_keywords(raw: Sequence[str]) -> List[str]:
-    return [k.strip() for k in raw if re.fullmatch(r"[\w\- ]{2,}", k.strip())]
+    return [k.strip() for k in raw if 2 <= len(k.strip()) <= MAX_KEYWORD_LEN and re.fullmatch(r"[\w\- ]+", k.strip())]
 
 
 @st.cache_data(show_spinner=False)
 def build_keyword_structures(raw: Sequence[str]) -> Tuple[List[str], Dict[str, str]]:
     cleaned = sorted({k for k in _validate_keywords(raw)})
-    roots = {k for k in cleaned if k.isdigit() and len(k) <= 4}
+    roots = {k for k in cleaned if k.isdigit() and len(k) == 4}
 
     flat, mapping = [], {}
     for kw in cleaned:
         if kw.isdigit() and len(kw) == 4:
             mapping[kw] = kw
             flat.append(kw)
-            family_regex = fr"\\b{kw}\\d{{4}}\\b"
-            mapping[family_regex] = kw
-            flat.append(family_regex)
+            child_regex = fr"\b{kw}\d{{4}}\b"
+            mapping[child_regex] = kw
+            flat.append(child_regex)
         else:
             root = kw[:4] if kw[:4] in roots else kw
             mapping[kw] = root
@@ -77,10 +80,15 @@ def build_keyword_structures(raw: Sequence[str]) -> Tuple[List[str], Dict[str, s
 
 
 def compile_patterns(tokens: Sequence[str]) -> List[re.Pattern]:
-    return [re.compile("|".join(tokens[i:i+REGEX_CHUNK_SIZE]), re.I) for i in range(0, len(tokens), REGEX_CHUNK_SIZE)]
+    try:
+        return [re.compile("|".join(tokens[i:i+REGEX_CHUNK_SIZE]), re.I) for i in range(0, len(tokens), REGEX_CHUNK_SIZE)]
+    except re.error as e:
+        LOG.error("Regex compile error: %s", e)
+        return []
 
+# ────────── HTTP fetch with retries ──────────
 
-async def fetch(session: aiohttp.ClientSession, url: str, retries=3, backoff=1.7) -> bytes:
+async def fetch(session: aiohttp.ClientSession, url: str, retries: int = 3, backoff: float = 1.7) -> bytes:
     for attempt in range(1, retries + 1):
         try:
             async with async_timeout.timeout(DEFAULT_TIMEOUT):
@@ -93,6 +101,7 @@ async def fetch(session: aiohttp.ClientSession, url: str, retries=3, backoff=1.7
                 raise
             await asyncio.sleep(backoff ** attempt)
 
+# ────────── Sitemap discovery ──────────
 
 async def _locs_from_sitemap(session: aiohttp.ClientSession, url: str) -> List[str]:
     try:
@@ -103,8 +112,7 @@ async def _locs_from_sitemap(session: aiohttp.ClientSession, url: str) -> List[s
         root_name = etree.QName(tree.getroot()).localname
         if root_name in {"urlset", "sitemapindex"}:
             return [loc.text.strip() for loc in tree.findall(".//{*}loc")]
-        else:
-            return []
+        return []
     except Exception as exc:
         LOG.warning("Parse failed %s – %s", url, exc)
         return []
@@ -129,6 +137,7 @@ async def discover_urls(session: aiohttp.ClientSession, sitemaps: List[str]) -> 
     prog.empty()
     return list(dict.fromkeys(pages))
 
+# ────────── Helpers ──────────
 
 def to_jamku_url(pice_url: str) -> str | None:
     if m := GSTIN_RE.search(pice_url):
@@ -138,16 +147,20 @@ def to_jamku_url(pice_url: str) -> str | None:
 
 async def _scan_page(session: aiohttp.ClientSession, url: str, patterns: List[re.Pattern], simple_keywords: Sequence[str], sem: asyncio.Semaphore) -> Tuple[str, str, str] | None:
     async with sem:
-        html_bytes = await fetch(session, url)
-        html = html_bytes.decode("utf-8", "ignore")
-        if not any(kw in html for kw in simple_keywords):
+        try:
+            html_bytes = await fetch(session, url)
+            html = html_bytes.decode("utf-8", "ignore")
+            if not any(kw in html for kw in simple_keywords):
+                return None
+            match = next((m for p in patterns if (m := p.search(html))), None)
+            if match:
+                soup = BeautifulSoup(html, "html.parser")
+                title = (soup.title.string or "").strip() if soup.title else ""
+                return url, match.group(0), title
             return None
-        match = next((m for p in patterns if (m := p.search(html))), None)
-        if match:
-            soup = BeautifulSoup(html, "html.parser")
-            title = (soup.title.string or "").strip() if soup.title else ""
-            return url, match.group(0), title
-        return None
+        except Exception as e:
+            LOG.error("[Scan Fail] %s – %s", url, e)
+            raise Exception(url) from e  # propagate URL for retry log
 
 
 async def _scan_jamku_wrapper(session: aiohttp.ClientSession, url: str, patterns: List[re.Pattern], simple_keywords: Sequence[str], sem: asyncio.Semaphore, rate_delay: float):
@@ -157,6 +170,7 @@ async def _scan_jamku_wrapper(session: aiohttp.ClientSession, url: str, patterns
         finally:
             await asyncio.sleep(rate_delay)
 
+# ────────── Main crawl routine ──────────
 
 async def crawl_and_retry(sitemaps: List[str], raw_keywords: List[str], concurrency: int, batch_size: int, jamku_rate: int) -> pd.DataFrame:
     tokens, root_map = build_keyword_structures(tuple(raw_keywords))
@@ -175,6 +189,9 @@ async def crawl_and_retry(sitemaps: List[str], raw_keywords: List[str], concurre
 
     async with aiohttp.ClientSession(connector=conn, timeout=timeout, headers=headers) as session:
         base_pages = await discover_urls(session, sitemaps)
+        if not base_pages:
+            st.error("❌ No URLs discovered. Check sitemap or network access.")
+            return pd.DataFrame()
         st.info(f"🌐 Total Piceapp pages discovered: {len(base_pages):,}")
 
         sem = asyncio.Semaphore(concurrency)
@@ -188,10 +205,10 @@ async def crawl_and_retry(sitemaps: List[str], raw_keywords: List[str], concurre
                 if isinstance(res, tuple):
                     results.append(res)
                 elif isinstance(res, Exception):
-                    failed_pice_urls.append(res.args[0] if res.args else "")
+                    failed_pice_urls.append(str(res))
             if batch_idx % 1 == 0:
                 prog.progress(min(1.0, scanned / len(base_pages)), text=f"⚡ Scanning Piceapp … {scanned}/{len(base_pages):,}")
-            if batch_idx % CHECKPOINT_EVERY == 0:
+            if batch_idx % CHECKPOINT_EVERY == 0 and results:
                 _checkpoint(results)
         prog.empty()
         st.success(f"✅ Piceapp phase completed in {time.perf_counter() - start:.1f}s")
@@ -202,21 +219,23 @@ async def crawl_and_retry(sitemaps: List[str], raw_keywords: List[str], concurre
             return _to_df(results, root_map)
 
         st.info(f"♻️ Retrying {len(jamku_urls):,} failed URLs via Jamku ({jamku_rate}/sec max)")
-
         sem_jamku, rate_delay = asyncio.Semaphore(jamku_rate), 1 / jamku_rate
         prog_j = st.empty()
 
         jamku_tasks = [_scan_jamku_wrapper(session, u, patterns, simple_keywords, sem_jamku, rate_delay) for u in jamku_urls]
         completed = 0
         for f in asyncio.as_completed(jamku_tasks):
-            res = await f
+            try:
+                res = await f
+            except Exception as e:
+                LOG.warning("Jamku retry failed: %s", e)
+                continue
             completed += 1
             if isinstance(res, tuple):
                 results.append(res)
             if completed % 10 == 0:
                 prog_j.progress(completed / len(jamku_urls), text="🔄 Scanning Jamku …")
         prog_j.empty()
-
     return _to_df(results, root_map)
 
 
@@ -234,21 +253,24 @@ def _to_df(records: List[Tuple[str, str, str]], root_map: Dict[str, str]) -> pd.
     return df[["url", "matched_keyword", "matched_root", "page_title"]]
 
 
+# ────────── Streamlit UI ──────────
+
 st.set_page_config(page_title="Keyword Sitemap Crawler", layout="wide")
+
 try:
     from streamlit_autorefresh import st_autorefresh
     st_autorefresh(interval=60 * 1000, limit=None, key="keepalive")
 except ImportError:
     pass
 
-st.title("🔍 Keyword Sitemap Crawler — Ultimate Turbo 🚀")
+st.title("🔍 Keyword Sitemap Crawler — Ultimate Turbo Edition 🚀")
 
 with st.form("crawl_form"):
     sitemaps_input = st.text_area("Sitemap URL(s) (one per line)", height=120)
     kw_file = st.file_uploader("Keyword list (TXT)", type=["txt"])
     col1, col2, col3 = st.columns(3)
     concurrency = col1.slider("Concurrency (Piceapp phase)", 20, 800, DEFAULT_CONCURRENCY, 20)
-    batch_size = col2.slider("Batch size", 200, 5_000, DEFAULT_BATCH_SIZE, 200)
+    batch_size = col2.slider("Batch size", 200, 5000, DEFAULT_BATCH_SIZE, 200)
     jamku_rate = col3.slider("Jamku requests / sec", 1, 10, 3)
     submitted = st.form_submit_button("🚀 Run Crawl")
 
@@ -264,7 +286,9 @@ if submitted:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        df_out = loop.run_until_complete(crawl_and_retry(sitemap_list, raw_kw, concurrency, batch_size, jamku_rate))
+        df_out = loop.run_until_complete(
+            crawl_and_retry(sitemap_list, raw_kw, concurrency, batch_size, jamku_rate)
+        )
     finally:
         loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()
@@ -278,9 +302,9 @@ if submitted:
 
         if len(df_out) < 20_000:
             chart_data = df_out["matched_root"].value_counts().reset_index(names=["matched_root", "count"])
-            bar = alt.Chart(chart_data).mark_bar().encode(
+            chart = alt.Chart(chart_data).mark_bar().encode(
                 x="matched_root:N", y="count:Q", tooltip=["matched_root", "count"]
-            ).properties(title="Match count by root", height=400)
-            st.altair_chart(bar, use_container_width=True)
+            ).properties(title="Match Count by Root", height=400)
+            st.altair_chart(chart, use_container_width=True)
         else:
-            st.info("📊 Chart skipped due to large result set (≥20K rows).")
+              st.info("📊 Chart skipped due to large result set (≥20K rows).")
