@@ -6,3 +6,7 @@ tqdm
 tenacity
 beautifulsoup4
 more_itertools
+pandas
+bs4
+lxml
+altair
