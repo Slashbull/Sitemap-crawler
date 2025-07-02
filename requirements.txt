@@ -5,3 +5,4 @@ lxml
 tqdm
 tenacity
 beautifulsoup4
+more_itertools
