@@ -108,8 +108,10 @@ async def _locs_from_sitemap(session: aiohttp.ClientSession, url: str) -> List[s
             raw = gzip.decompress(raw)
         tree = etree.parse(BytesIO(raw))
         root_name = etree.QName(tree.getroot()).localname
-        return [loc.text.strip() for loc in tree.findall(".//{*}loc")]
-        if root_name in {"urlset", "sitemapindex"} else []
+        if root_name in {"urlset", "sitemapindex"}:
+            return [loc.text.strip() for loc in tree.findall(".//{*}loc")]
+        else:
+            return []
     except Exception as exc:
         LOG.warning("Parse failed %s – %s", url, exc)
         return []
