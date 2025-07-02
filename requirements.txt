@@ -11,3 +11,4 @@ bs4
 lxml
 altair
 ujson
+streamlit-autorefresh
