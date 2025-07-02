@@ -1,0 +1,7 @@
+streamlit
+aiohttp
+async-timeout
+lxml
+tqdm
+tenacity
+beautifulsoup4
