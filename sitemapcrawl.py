@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
 """
-Keyword Sitemap Crawler – Streamlit App
-======================================
-All‑async, fault‑tolerant crawler that scans **millions of URLs** for any of your
-keywords (HS‑codes, SKUs, phrases …) and outputs a CSV.
+Keyword Sitemap Crawler – Piceapp / Jamku Edition
+================================================
+Streamlit app that can either:
+1. Crawl **Piceapp** sitemaps directly and scan every page for keywords.
+2. Take the **same Piceapp sitemap**, extract the GSTIN from each URL, build the
+   corresponding **Jamku** URL (``https://gst.jamku.app/gstin/<GSTIN>``) and scan
+   *those* pages for the keywords.
 
-Built for Streamlit Community Cloud, but will happily run anywhere.
+Highlights
+----------
+* Handles **1 M+ pages** with asyncio, aiohttp and batching.
+* Works on Streamlit Cloud free tier.
+* **Dropdown** lets the user pick *Piceapp* or *Jamku* mode.
+* "Master" 4‑digit HS codes (e.g. ``0813``) automatically expand to their full
+  8‑digit family (e.g. ``0813\d{4}``).
+* Regex chunking prevents the "pattern too large" error when thousands of
+  keywords are supplied.
+* CSV always downloadable – even if no matches are found (empty file).
 
-Main upgrades over the previous version
---------------------------------------
-* **Scales to 1 000 000+ URLs** – memory‑light: only matched pages are kept.
-* **Regex‑chunking** – avoids the "pattern too large" error with thousands of
-  keywords by splitting them into manageable 1 000‑keyword groups.
-* **100 % task completion** using `asyncio.gather(return_exceptions=True)`.
-* **CSV button always shown** – even if no matches were found (empty file
-  included).
-* **Progress bars** tuned for huge datasets (no int‑overflow, fast updates).
-* **Config sliders** widened (concurrency up to 500, batch size up to 5 000).
-* **Clean loop shutdown** – zero "Task was destroyed" warnings.
-
-Install requirements
---------------------
+Install
+-------
 ```bash
 pip install streamlit aiohttp async-timeout lxml beautifulsoup4 tqdm pandas more_itertools tenacity
 ```
-If you deploy to Streamlit Cloud, put those lines in `requirements.txt`.
+Add those lines to ``requirements.txt`` if deploying to Streamlit Cloud.
 """
 from __future__ import annotations
 
@@ -45,28 +45,44 @@ from lxml import etree
 from more_itertools import chunked
 
 # ────────────────────────────── Config & Logging ──────────────────────────────
-DEFAULT_TIMEOUT = 20            # seconds per HTTP request (tweak if needed)
-DEFAULT_CONCURRENCY = 50        # default max simultaneous requests (slider up to 500)
-DEFAULT_BATCH_SIZE = 1000       # URLs processed in one async batch (slider up to 5 000)
-REGEX_CHUNK_SIZE = 1000         # max keywords per compiled regex – prevents HUGE patterns
+DEFAULT_TIMEOUT = 20            # seconds per HTTP request
+DEFAULT_CONCURRENCY = 50        # default concurrency (slider up to 500)
+DEFAULT_BATCH_SIZE = 1000       # URLs processed per async batch (slider up to 5 000)
+REGEX_CHUNK_SIZE = 1000         # max keywords per compiled regex
+GSTIN_RE = re.compile(r"[0-9]{2}[A-Z0-9]{10}[0-9A-Z]{3}", re.IGNORECASE)  # 15‑char GSTIN
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 LOGGER = logging.getLogger("keyword‑crawler")
 
-# ────────────────────────────── Utility: regex chunker ─────────────────────────
+# ────────────────────────────── Pattern helper ───────────────────────────────
 
-def compile_patterns(keywords: Sequence[str], chunk_size: int = REGEX_CHUNK_SIZE) -> List[re.Pattern]:
-    """Return a list of regex patterns, each containing ≤ *chunk_size* keywords."""
-    cleaned = [k for k in keywords if k]
+def expand_master_keywords(keywords: Sequence[str]) -> List[str]:
+    """Return list with 4‑digit numeric masters expanded to 8‑digit regex family."""
+    expanded: List[str] = []
+    for kw in keywords:
+        kw = kw.strip()
+        if not kw:
+            continue
+        if kw.isdigit() and len(kw) == 4:  # master code e.g. 0813
+            expanded.append(fr"\b{kw}\d{{4}}\b")  # 0813xxxx
+        expanded.append(kw)
+    return expanded
+
+
+def compile_patterns(keywords: Sequence[str], *, chunk_size: int = REGEX_CHUNK_SIZE) -> List[re.Pattern]:
+    """Split *keywords* into chunks and compile each to a regex."""
+    clean = expand_master_keywords(keywords)
     patterns: List[re.Pattern] = []
-    for i in range(0, len(cleaned), chunk_size):
-        group = "|".join(map(re.escape, cleaned[i : i + chunk_size]))
+    for i in range(0, len(clean), chunk_size):
+        group = "|".join(map(re.escape, clean[i : i + chunk_size]))
+        # If we already injected explicit regex (\b0813\d{4}\b) don't escape
+        group = group.replace(r"\\b", r"\b").replace(r"\\d", r"\d")
         patterns.append(re.compile(group, re.IGNORECASE))
     return patterns
 
 # ────────────────────────────── Async HTTP Fetch ──────────────────────────────
 async def fetch(session: aiohttp.ClientSession, url: str) -> bytes:
-    """GET *url* returning raw bytes, with DEFAULT_TIMEOUT and SSL verification disabled."""
+    """GET *url* with timeout and SSL disabled."""
     try:
         async with async_timeout.timeout(DEFAULT_TIMEOUT):
             async with session.get(url, ssl=False) as resp:
@@ -78,7 +94,6 @@ async def fetch(session: aiohttp.ClientSession, url: str) -> bytes:
 
 # ───────────── Recursive discovery of <loc> children in sitemap(‑index) ─────────
 async def _locs_from_sitemap(session: aiohttp.ClientSession, url: str) -> List[str]:
-    """Return every <loc> text inside *url* (handles .xml and .gz)."""
     try:
         raw = await fetch(session, url)
         if url.endswith(".gz"):
@@ -91,7 +106,6 @@ async def _locs_from_sitemap(session: aiohttp.ClientSession, url: str) -> List[s
         return []
 
 async def discover_urls(session: aiohttp.ClientSession, start_sitemaps: Iterable[str]) -> List[str]:
-    """Breadth‑first crawl of *start_sitemaps* until every child URL is found."""
     queue: List[str] = list(dict.fromkeys(start_sitemaps))
     seen: Set[str] = set()
     pages: List[str] = []
@@ -112,7 +126,7 @@ async def discover_urls(session: aiohttp.ClientSession, start_sitemaps: Iterable
         processed += 1
         prog.progress(processed / (processed + len(queue) + 1e-9))
     prog.empty()
-    return list(dict.fromkeys(pages))  # de‑duplicate, preserve order
+    return list(dict.fromkeys(pages))
 
 # ─────────────── Keyword scan (HTML contains any of the patterns) ──────────────
 async def _page_contains_keyword(
@@ -126,8 +140,7 @@ async def _page_contains_keyword(
             html = (await fetch(session, url)).decode("utf-8", errors="ignore")
         except Exception:
             return None
-
-        for pattern in patterns:  # loop through pattern chunks, break fast on first match
+        for pattern in patterns:
             m = pattern.search(html)
             if m:
                 soup = BeautifulSoup(html, "html.parser")
@@ -138,34 +151,43 @@ async def _page_contains_keyword(
 async def crawl(
     sitemaps: List[str],
     keywords: List[str],
+    mode: str,  # "Piceapp" or "Jamku"
     concurrency: int,
     batch_size: int,
     domain_filter: str | None = None,
 ):
-    """Discover URLs → scan in batches → return DataFrame of matches."""
     patterns = compile_patterns(keywords)
     sem = asyncio.Semaphore(concurrency)
     timeout = aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT)
     connector = aiohttp.TCPConnector(limit=concurrency)
+
     results: list[tuple[str, str, str]] = []
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         pages = await discover_urls(session, sitemaps)
+
+        # Mode‑specific URL transform
+        if mode == "Jamku":
+            new_pages: List[str] = []
+            for p in pages:
+                m = GSTIN_RE.search(p)
+                if m:
+                    gstin = m.group(0).upper()
+                    new_pages.append(f"https://gst.jamku.app/gstin/{gstin}")
+            pages = list(dict.fromkeys(new_pages))  # deduplicate
+            st.info(f"🔗 Transformed to {len(pages):,} Jamku URLs")
+
         if domain_filter:
             pages = [u for u in pages if domain_filter in u]
-        st.info(f"🌐 Discovered {len(pages):,} page URLs to scan")
+        st.info(f"🌐 Total pages to scan: {len(pages):,}")
 
         scanned = 0
         prog = st.progress(0.0, text="🔍 Scanning pages …")
         start = time.perf_counter()
 
-        for page_batch in chunked(pages, batch_size):
-            tasks = [
-                _page_contains_keyword(session, url, patterns, sem) for url in page_batch
-            ]
-            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-            # Update counters & collect matches
-            for hit in batch_results:
+        for batch in chunked(pages, batch_size):
+            tasks = [_page_contains_keyword(session, url, patterns, sem) for url in batch]
+            for hit in await asyncio.gather(*tasks, return_exceptions=True):
                 scanned += 1
                 if isinstance(hit, tuple):
                     results.append(hit)
@@ -176,52 +198,19 @@ async def crawl(
 
     return pd.DataFrame(results, columns=["url", "matched_keyword", "page_title"])
 
-# ────────────────────────────── Streamlit UI ──────────────────────────────
+# ────────────────────────────── Streamlit UI ────────────────────────────────
 st.set_page_config(page_title="Keyword Sitemap Crawler", layout="wide")
-st.title("🔍 Keyword Sitemap Crawler – Million‑URL Edition")
-st.caption("Find every page containing your keywords – massively parallel, no crashes.")
+st.title("🔍 Keyword Sitemap Crawler – Piceapp / Jamku Edition")
+st.caption("Crawl Piceapp sitemaps directly or jump to matching Jamku GSTIN pages.")
 
 with st.form("crawl_form"):
     col1, col2 = st.columns(2)
     with col1:
+        mode = st.selectbox("Site mode", ["Piceapp", "Jamku"], index=0)
         sitemap_input = st.text_area("🌐 Sitemap URLs (one per line)")
-        domain_filter = st.text_input("🔗 Optional domain filter (e.g. example.com)")
+        domain_filter = st.text_input("🔗 Optional domain filter")
     with col2:
         keyword_file = st.file_uploader("📄 Upload Keyword List (one per line)", type=["txt"])
         concurrency = st.slider("⚙️ Concurrent HTTP Requests", 10, 500, DEFAULT_CONCURRENCY, 10)
         batch_size = st.slider("📦 Batch size", 200, 5000, DEFAULT_BATCH_SIZE, 200)
-    submitted = st.form_submit_button("🚀 Start Crawling")
-
-if submitted:
-    if not sitemap_input or not keyword_file:
-        st.error("Please provide at least one sitemap URL and a keyword file.")
-        st.stop()
-
-    sitemaps = [u.strip() for u in sitemap_input.splitlines() if u.strip()]
-    raw_keywords = keyword_file.read().decode("utf-8").splitlines()
-    keywords = [k.strip() for k in raw_keywords if k.strip()]
-
-    st.write(
-        "**🔑 Keywords uploaded:** ",
-        ", ".join(keywords[:20]) + (" …" if len(keywords) > 20 else ""),
-    )
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    try:
-        df = loop.run_until_complete(
-            crawl(sitemaps, keywords, concurrency, batch_size, domain_filter or None)
-        )
-    finally:
-        loop.run_until_complete(loop.shutdown_asyncgens())
-        loop.close()
-
-    # ────────────────────── Results & CSV download ──────────────────────
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
-    st.download_button("📥 Download CSV", csv_bytes, "matched_urls.csv", "text/csv")
-
-    if df.empty:
-        st.warning("No matches found!")
-    else:
-        st.dataframe(df, use_container_width=True)
+    submitted = st.form_submit
