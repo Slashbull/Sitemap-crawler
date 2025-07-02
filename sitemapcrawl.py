@@ -1,132 +1,174 @@
-# 📦 Install required packages before running:
-# pip install streamlit aiohttp async-timeout lxml tqdm tenacity beautifulsoup4
+#!/usr/bin/env python3
+"""
+Keyword Sitemap Crawler – Streamlit App
+======================================
+A production‑grade, fully asynchronous sitemap crawler that finds every page
+whose HTML contains at least one user‑supplied keyword.  
+Optimised for Streamlit Community Cloud (free tier):
+* ⚡ Ultra‑fast aiohttp + asyncio with robust timeouts & batching
+* 🔁 Recursive sitemap‑index traversal (.xml & .gz) with smart de‑duplication
+* 📊 Real‑time progress bars for URL discovery and keyword scanning
+* 🛡️ Graceful error handling & logging – no hard crashes
+* 💾 Low‑memory design – processes pages in configurable batches
+* 📥 CSV export via Streamlit‟s download button (in‑memory; no temp‑files)
+* 🏷 Optional domain filter and concurrency controls
 
-import asyncio
-import aiohttp
-import async_timeout
-import gzip
-import re
-import logging
+Packages
+--------
+```
+pip install streamlit aiohttp async-timeout lxml beautifulsoup4 tqdm pandas more_itertools tenacity
+```
+Streamlit Cloud will auto‑install from `requirements.txt`.
+"""
+
+from __future__ import annotations
+import asyncio, gzip, logging, re, time
 from io import BytesIO
 from pathlib import Path
-from lxml import etree
+from typing import List, Tuple, Set, Iterable
+
+import aiohttp, async_timeout
 from bs4 import BeautifulSoup
-from typing import List, Tuple
+from lxml import etree
+from more_itertools import chunked
+import pandas as pd
 import streamlit as st
-from tempfile import NamedTemporaryFile
-import csv
 
-st.set_page_config(page_title="Keyword Sitemap Crawler", layout="wide")
-st.title("🔍 Keyword Sitemap Crawler")
+# ────────────────────────────── Config & Logging ──────────────────────────────
+DEFAULT_TIMEOUT = 15          # seconds for individual HTTP requests
+DEFAULT_CONCURRENCY = 25      # default max simultaneous HTTP requests
+DEFAULT_BATCH_SIZE  = 500     # URLs processed in one async batch
 
-logging.basicConfig(level=logging.INFO)
-LOGGER = logging.getLogger("crawler")
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+LOGGER = logging.getLogger("keyword‑crawler")
 
-DEFAULT_TIMEOUT = 15
-
-# ────────────────────────────── Async Fetch ──────────────────────────────
+# ────────────────────────────── Async HTTP Fetch ──────────────────────────────
 async def fetch(session: aiohttp.ClientSession, url: str) -> bytes:
-    async with async_timeout.timeout(DEFAULT_TIMEOUT):
-        async with session.get(url, ssl=False) as resp:
-            resp.raise_for_status()
-            return await resp.read()
+    """GET *url* returning raw bytes, with DEFAULT_TIMEOUT and SSL off."""
+    try:
+        async with async_timeout.timeout(DEFAULT_TIMEOUT):
+            async with session.get(url, ssl=False) as resp:
+                resp.raise_for_status()
+                return await resp.read()
+    except Exception as exc:
+        LOGGER.warning("Fetch failed %s → %s", url, exc)
+        raise
 
-# ────────────────────────────── Sitemap Parsing ──────────────────────────────
-async def _urls_from_sitemap(session: aiohttp.ClientSession, url: str) -> List[str]:
+# ───────────── Recursive discovery of <loc> children in sitemap(‑index) ─────────
+async def _locs_from_sitemap(session: aiohttp.ClientSession, url: str) -> List[str]:
+    """Return every <loc> text inside *url* (handles .xml and .gz)."""
     try:
         raw = await fetch(session, url)
         if url.endswith(".gz"):
             raw = gzip.decompress(raw)
         tree = etree.parse(BytesIO(raw))
-        root_tag = etree.QName(tree.getroot()).localname
-        if root_tag == "urlset":
-            return [loc.text for loc in tree.findall(".//{*}loc")]
-        if root_tag == "sitemapindex":
-            return [loc.text for loc in tree.findall(".//{*}loc")]
-        return []
-    except Exception as e:
-        LOGGER.warning(f"Failed to parse {url}: {e}")
+        root = etree.QName(tree.getroot()).localname
+        return [loc.text.strip() for loc in tree.findall(".//{*}loc")] if root in {"sitemapindex", "urlset"} else []
+    except Exception as exc:
+        LOGGER.warning("Parse failed %s → %s", url, exc)
         return []
 
-async def iter_sitemap_urls(session: aiohttp.ClientSession, sitemap_urls: List[str]) -> List[str]:
-    all_urls = []
-    seen = set()
-    to_visit = list(sitemap_urls)
+async def discover_urls(session: aiohttp.ClientSession, start_sitemaps: Iterable[str]) -> List[str]:
+    """Breadth‑first crawl of *start_sitemaps* until every child URL is found."""
+    queue: List[str] = list(dict.fromkeys(start_sitemaps))  # unique, preserved order
+    seen: Set[str] = set()
+    pages: List[str] = []
 
-    while to_visit:
-        sitemap = to_visit.pop()
+    prog = st.progress(0.0, text="🔍 Discovering URLs …")
+    processed = 0
+
+    while queue:
+        sitemap = queue.pop(0)
         if sitemap in seen:
             continue
         seen.add(sitemap)
-        urls = await _urls_from_sitemap(session, sitemap)
-        if urls and not urls[0].lower().endswith((".xml", ".gz")):
-            all_urls.extend(urls)
+        child_locs = await _locs_from_sitemap(session, sitemap)
+        if child_locs and child_locs[0].lower().endswith((".xml", ".gz")):
+            # It’s another sitemap‑index → enqueue
+            queue.extend(u for u in child_locs if u not in seen)
         else:
-            to_visit.extend(urls)
-    return all_urls
+            pages.extend(child_locs)
+        processed += 1
+        prog.progress(processed / (processed + len(queue) + 1e-9))
+    prog.empty()
+    return list(dict.fromkeys(pages))  # de‑duplicate, preserve order
 
-# ────────────────────────────── Keyword Matching ──────────────────────────────
-async def _page_contains_keyword(session, url, pattern, sem):
+# ─────────────── Keyword scan (HTML contains any of the patterns) ──────────────
+async def _page_contains_keyword(session: aiohttp.ClientSession, url: str, pattern: re.Pattern, sem: asyncio.Semaphore) -> Tuple[str, str, str] | None:
     async with sem:
         try:
-            html_bytes = await fetch(session, url)
-            text = html_bytes.decode("utf-8", errors="ignore")
-            match = pattern.search(text)
-            if match:
-                soup = BeautifulSoup(text, "html.parser")
-                title = soup.title.string.strip() if soup.title else ""
-                return url, match.group(0), title
+            html = (await fetch(session, url)).decode("utf-8", errors="ignore")
         except Exception:
             return None
-    return None
+        match = pattern.search(html)
+        if match:
+            soup = BeautifulSoup(html, "html.parser")
+            title = (soup.title.string or "").strip() if soup.title else ""
+            return url, match.group(0), title
+        return None
 
-async def crawl_sitemaps(sitemap_urls, keywords, concurrency):
+async def crawl(sitemaps: List[str], keywords: List[str], concurrency: int, batch_size: int, domain_filter: str | None = None):
+    """High‑level orchestration: discover URLs → scan per batch → yield DataFrame."""
     pattern = re.compile(r"|".join(map(re.escape, keywords)), re.IGNORECASE)
-    connector = aiohttp.TCPConnector(limit=concurrency)
-    timeout = aiohttp.ClientTimeout(total=None)
+    sem      = asyncio.Semaphore(concurrency)
+    timeout  = aiohttp.ClientTimeout(total=None)
+    connector= aiohttp.TCPConnector(limit=concurrency)
+    results  : list[tuple[str,str,str]] = []
 
-    results = []
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        urls = await iter_sitemap_urls(session, sitemap_urls)
-        st.info(f"Total URLs discovered: {len(urls)}")
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        pages = await discover_urls(session, sitemaps)
+        if domain_filter:
+            pages = [u for u in pages if domain_filter in u]
+        st.info(f"🌐 Discovered {len(pages):,} page URLs to scan")
 
-        sem = asyncio.Semaphore(concurrency)
-        tasks = [_page_contains_keyword(session, url, pattern, sem) for url in urls]
+        scanned = 0
+        prog = st.progress(0.0, text="🔍 Scanning pages …")
+        start = time.perf_counter()
+        for page_batch in chunked(pages, batch_size):
+            tasks = [_page_contains_keyword(session, u, pattern, sem) for u in page_batch]
+            for fut in asyncio.as_completed(tasks):
+                hit = await fut
+                scanned += 1
+                if hit:
+                    results.append(hit)
+                prog.progress(scanned / len(pages))
+        prog.empty()
+        st.success(f"✅ Completed in {time.perf_counter() - start:.1f}s – {len(results):,} matches")
 
-        for fut in asyncio.as_completed(tasks):
-            result = await fut
-            if result:
-                results.append(result)
-    return results
+    return pd.DataFrame(results, columns=["url", "matched_keyword", "page_title"])
 
-# ────────────────────────────── UI ──────────────────────────────
+# ────────────────────────────── Streamlit UI  ────────────────────────────────
+st.set_page_config(page_title="Keyword Sitemap Crawler", layout="wide")
+st.title("🔍 Keyword Sitemap Crawler")
+st.caption("Find every page containing your keywords – lightning fast and 100 % async.")
+
 with st.form("crawl_form"):
-    sitemap_input = st.text_area("Enter sitemap URLs (one per line)")
-    keyword_file = st.file_uploader("Upload Keyword List (one per line)", type=["txt"])
-    concurrency = st.slider("Concurrent HTTP Requests", 5, 100, 25)
-    submitted = st.form_submit_button("Start Crawling")
+    col1, col2 = st.columns(2)
+    with col1:
+        sitemap_input = st.text_area("🌐 Sitemap URLs (one per line)")
+        domain_filter = st.text_input("🔗 Optional domain filter (e.g. example.com)")
+    with col2:
+        keyword_file  = st.file_uploader("📄 Upload Keyword List (one per line)", type=["txt"])
+        concurrency   = st.slider("⚙️ Concurrent HTTP Requests", 5, 200, DEFAULT_CONCURRENCY, 5)
+        batch_size    = st.slider("📦 Batch size", 100, 1000, DEFAULT_BATCH_SIZE, 100)
+    submitted = st.form_submit_button("🚀 Start Crawling")
 
-if submitted and sitemap_input and keyword_file:
-    sitemap_urls = [u.strip() for u in sitemap_input.strip().splitlines() if u.strip()]
-    keywords = [line.strip() for line in keyword_file.read().decode("utf-8").splitlines() if line.strip()]
+if submitted:
+    if not sitemap_input or not keyword_file:
+        st.error("Please provide at least one sitemap URL and a keyword file.")
+        st.stop()
 
-    with st.spinner("Crawling in progress..."):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        matches = loop.run_until_complete(crawl_sitemaps(sitemap_urls, keywords, concurrency))
+    sitemaps = [u.strip() for u in sitemap_input.splitlines() if u.strip()]
+    keywords = [k.strip() for k in keyword_file.read().decode("utf-8").splitlines() if k.strip()]
+    st.write("**🔑 Keywords uploaded:**", ", ".join(keywords[:20]) + (" …" if len(keywords) > 20 else ""))
 
-    if matches:
-        st.success(f"✅ Found {len(matches)} matching pages!")
-        st.dataframe(matches, use_container_width=True)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    df = loop.run_until_complete(crawl(sitemaps, keywords, concurrency, batch_size, domain_filter or None))
 
-        # Export to CSV
-        with NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
-            writer = csv.writer(tmp)
-            writer.writerow(["url", "matched_keyword", "page_title"])
-            writer.writerows(matches)
-            tmp_path = tmp.name
-
-        with open(tmp_path, "rb") as f:
-            st.download_button("📥 Download Results", f, file_name="matched_urls.csv")
-    else:
+    if df.empty:
         st.warning("No matches found!")
+    else:
+        st.dataframe(df, use_container_width=True)
+        csv_bytes = df.to_csv(index=False).encode("utf-8")
+        st.download_button("📥 Download CSV", csv_bytes, "matched_urls.csv", "text/csv")
