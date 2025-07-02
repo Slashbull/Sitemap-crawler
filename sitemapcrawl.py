@@ -296,7 +296,10 @@ def _to_df(records: List[Tuple[str, str, str]], root_map: Dict[str, str]) -> pd.
 
 st.set_page_config(page_title="Keyword Sitemap Crawler", layout="wide")
 
-st_autorefresh = st.experimental_rerun  # future‑proof; simple keep‑alive
+from streamlit_autorefresh import st_autorefresh
+
+# Run this outside the async event loop
+st_autorefresh(interval=60 * 1000, limit=None, key="keepalive")
 
 st.title("🔍 Keyword Sitemap Crawler — Ultimate Turbo 🚀")
 
