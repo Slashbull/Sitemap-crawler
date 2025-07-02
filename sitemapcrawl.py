@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Keyword Sitemap Crawler — Smart Root‑Aware Edition
-==================================================
-• Dropdown for **Piceapp** (direct sitemap crawl) or **Jamku** (GSTIN‑rewritten URLs).  
-• Handles **1 M+ pages** with fully‑async aiohttp.  
-• **Root‑aware keyword mapping**: any 4‑digit numeric “master” (e.g. `0813`) captures all 8‑digit codes that start with it (e.g. `08131000`).  
-• Outputs **matched_root** column so you can aggregate hits at the HS‑chapter level.  
-• Regex chunking prevents huge‑pattern errors.  
-• CSV always downloadable.
+Keyword Sitemap Crawler — Smart Root‑Aware Edition + Turnover Extractor
+=======================================================================
+• Dropdown for **Piceapp** (sitemap crawl) or **Jamku** (GSTIN‑rewritten URLs).
+• Handles **1 M+ pages** async with aiohttp.
+• Root‑aware keyword mapping: `0813` captures all `0813xxxx`.
+• Extracts "Slab" & "Turnover" text near matches from web page.
+• Outputs **matched_root**, **slab**, and **turnover** in CSV.
 """
 
 from __future__ import annotations
@@ -24,54 +23,41 @@ from bs4 import BeautifulSoup
 from lxml import etree
 from more_itertools import chunked
 
-# ───────────────────────── Config ─────────────────────────
-DEFAULT_TIMEOUT      = 20
-DEFAULT_CONCURRENCY  = 50
-DEFAULT_BATCH_SIZE   = 1000
-REGEX_CHUNK_SIZE     = 1000
-GSTIN_PATTERN        = re.compile(r"[0-9]{2}[A-Z0-9]{10}[0-9A-Z]{3}", re.IGNORECASE)
+# ─────────── Config ───────────
+DEFAULT_TIMEOUT = 20
+DEFAULT_CONCURRENCY = 50
+DEFAULT_BATCH_SIZE = 1000
+REGEX_CHUNK_SIZE = 1000
+GSTIN_PATTERN = re.compile(r"[0-9]{2}[A-Z0-9]{10}[0-9A-Z]{3}", re.IGNORECASE)
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 LOGGER = logging.getLogger("keyword-crawler")
 
-# ──────────── Keyword preprocessing (root mapping) ────────────
-
+# ─────────── Keyword mapping (root aware) ───────────
 def build_keyword_mapping(raw_keywords: Sequence[str]) -> Tuple[List[str], Dict[str, str]]:
-    """Detect masters (≤4 digit numbers) and map every keyword to its root."""
     cleaned = sorted({k.strip() for k in raw_keywords if k.strip()})
-    roots   = {k for k in cleaned if k.isdigit() and len(k) <= 4}
-
+    roots = {k for k in cleaned if k.isdigit() and len(k) <= 4}
     mapping: Dict[str, str] = {}
     flat: List[str] = []
-
     for kw in cleaned:
         if kw.isdigit() and len(kw) == 4:
-            # Treat as master but still match it exactly
             mapping[kw] = kw
             flat.append(kw)
-            # Add regex for its 8‑digit family
-            family_regex = fr"\b{kw}\d{{4}}\b"  # 0813xxxx
-            mapping[family_regex] = kw  # map regex token -> root
+            family_regex = fr"\\b{kw}\\d{{4}}\\b"
+            mapping[family_regex] = kw
             flat.append(family_regex)
         else:
-            # Long code: derive root as first 4 digits if present in roots
             root = kw[:4] if kw[:4] in roots else kw
             mapping[kw] = root
             flat.append(kw)
     return flat, mapping
 
-# ──────────── Regex chunking ────────────
-
+# ─────────── Regex compiler ───────────
 def compile_patterns(tokens: Sequence[str]) -> List[re.Pattern]:
-    patterns = []
-    for i in range(0, len(tokens), REGEX_CHUNK_SIZE):
-        chunk = tokens[i:i + REGEX_CHUNK_SIZE]
-        # Tokens may already contain \b / \d – keep raw
-        pattern_src = "|".join(chunk)
-        patterns.append(re.compile(pattern_src, re.IGNORECASE))
-    return patterns
+    return [re.compile("|".join(tokens[i:i + REGEX_CHUNK_SIZE]), re.IGNORECASE)
+            for i in range(0, len(tokens), REGEX_CHUNK_SIZE)]
 
-# ──────────── Async fetch ────────────
+# ─────────── HTTP fetch ───────────
 async def fetch(session: aiohttp.ClientSession, url: str) -> bytes:
     try:
         async with async_timeout.timeout(DEFAULT_TIMEOUT):
@@ -82,7 +68,7 @@ async def fetch(session: aiohttp.ClientSession, url: str) -> bytes:
         LOGGER.warning("Fetch failed %s → %s", url, exc)
         raise
 
-# ──────────── Sitemap discovery ────────────
+# ─────────── Sitemap discovery ───────────
 async def _locs_from_sitemap(session: aiohttp.ClientSession, url: str) -> List[str]:
     try:
         raw = await fetch(session, url)
@@ -114,18 +100,20 @@ async def discover_urls(session: aiohttp.ClientSession, sitemaps: List[str]) -> 
     prog.empty()
     return list(dict.fromkeys(pages))
 
-# ──────────── Jamku URL builder ────────────
-
+# ─────────── Jamku links ───────────
 def to_jamku_urls(pice_urls: List[str]) -> List[str]:
-    jamku_urls = []
-    for url in pice_urls:
-        m = GSTIN_PATTERN.search(url)
-        if m:
-            jamku_urls.append(f"https://gst.jamku.app/gstin/{m.group(0).lower()}")
-    return list(dict.fromkeys(jamku_urls))
+    return [f"https://gst.jamku.app/gstin/{m.group(0).lower()}"
+            for url in pice_urls if (m := GSTIN_PATTERN.search(url))]
 
-# ──────────── HTML keyword scan ────────────
-async def _page_scan(session: aiohttp.ClientSession, url: str, patterns: List[re.Pattern], sem: asyncio.Semaphore) -> Tuple[str, str, str] | None:
+# ─────────── Scan page content ───────────
+def extract_slab_and_turnover(html: str) -> Tuple[str, str]:
+    slab_match = re.search(r"Slab: ([^<\n]*)", html, re.IGNORECASE)
+    slab = slab_match.group(1).strip() if slab_match else ""
+    turnover_match = re.search(r"Turnover[^:<\n]*[:\s]+([^<\n]*)", html, re.IGNORECASE)
+    turnover = turnover_match.group(1).strip() if turnover_match else ""
+    return slab, turnover
+
+async def _page_scan(session: aiohttp.ClientSession, url: str, patterns: List[re.Pattern], sem: asyncio.Semaphore) -> Tuple[str, str, str, str, str] | None:
     async with sem:
         try:
             html = (await fetch(session, url)).decode("utf-8", errors="ignore")
@@ -134,28 +122,24 @@ async def _page_scan(session: aiohttp.ClientSession, url: str, patterns: List[re
         for pat in patterns:
             m = pat.search(html)
             if m:
-                title = ""
-                try:
-                    title = (BeautifulSoup(html, "html.parser").title.string or "").strip()
-                except Exception:
-                    pass
-                return url, m.group(0), title
+                soup = BeautifulSoup(html, "html.parser")
+                title = (soup.title.string or "").strip() if soup.title else ""
+                slab, turnover = extract_slab_and_turnover(html)
+                return url, m.group(0), title, slab, turnover
         return None
 
-# ──────────── Crawl orchestrator ────────────
+# ─────────── Orchestrator ───────────
 async def crawl(sitemaps: List[str], raw_keywords: List[str], mode: str, concurrency: int, batch_size: int) -> pd.DataFrame:
     flat_keywords, root_map = build_keyword_mapping(raw_keywords)
     patterns = compile_patterns(flat_keywords)
-
     sem = asyncio.Semaphore(concurrency)
     timeout = aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT)
     connector = aiohttp.TCPConnector(limit=concurrency)
-    results: List[Tuple[str, str, str]] = []
+    results = []
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         base_pages = await discover_urls(session, sitemaps)
         pages = base_pages if mode == "Piceapp" else to_jamku_urls(base_pages)
-
         st.info(f"🌐 Total pages queued: {len(pages):,}")
         scanned = 0
         prog = st.progress(0.0, text="Scanning pages…")
@@ -172,22 +156,22 @@ async def crawl(sitemaps: List[str], raw_keywords: List[str], mode: str, concurr
         prog.empty()
         st.success(f"✅ Finished in {time.perf_counter() - start:.1f}s – {len(results):,} matches")
 
-    df = pd.DataFrame(results, columns=["url", "matched_keyword", "page_title"])
+    df = pd.DataFrame(results, columns=["url", "matched_keyword", "page_title", "slab", "turnover"])
     df["matched_root"] = df["matched_keyword"].apply(lambda k: root_map.get(k, k))
-    return df[["url", "matched_keyword", "matched_root", "page_title"]]
+    return df[["url", "matched_keyword", "matched_root", "page_title", "slab", "turnover"]]
 
-# ──────────── Streamlit UI ────────────
+# ─────────── UI ───────────
 st.set_page_config(page_title="Keyword Sitemap Crawler", layout="wide")
-st.title("🔍 Keyword Sitemap Crawler (Root‑Aware)")
+st.title("🔍 Keyword Sitemap Crawler + Turnover Extractor")
 
 with st.form("crawl_form"):
-    mode         = st.selectbox("Mode", ["Piceapp", "Jamku"], index=0)
+    mode = st.selectbox("Mode", ["Piceapp", "Jamku"], index=0)
     sitemaps_txt = st.text_area("Sitemap URL(s)", height=120)
     keyword_file = st.file_uploader("Keyword list (TXT)", type=["txt"])
     col1, col2 = st.columns(2)
     concurrency = col1.slider("Concurrency", 10, 500, DEFAULT_CONCURRENCY, 10)
-    batch_size  = col2.slider("Batch size", 200, 5000, DEFAULT_BATCH_SIZE, 200)
-    submitted   = st.form_submit_button("🚀 Crawl")
+    batch_size = col2.slider("Batch size", 200, 5000, DEFAULT_BATCH_SIZE, 200)
+    submitted = st.form_submit_button("🚀 Crawl")
 
 if submitted:
     if not sitemaps_txt or not keyword_file:
@@ -195,8 +179,7 @@ if submitted:
         st.stop()
 
     sitemaps = [l.strip() for l in sitemaps_txt.splitlines() if l.strip()]
-    raw_kw   = keyword_file.read().decode("utf-8", errors="ignore").splitlines()
-
+    raw_kw = keyword_file.read().decode("utf-8", errors="ignore").splitlines()
     st.write("Loaded", len(raw_kw), "keywords (including masters & children)")
 
     loop = asyncio.new_event_loop()
@@ -207,4 +190,10 @@ if submitted:
         loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()
 
-    st.download
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button("📥 Download CSV", csv_bytes, "matched_urls.csv", "text/csv")
+
+    if df.empty:
+        st.warning("⚠️ No keyword matches found.")
+    else:
+        st.dataframe(df, use_container_width=True)
